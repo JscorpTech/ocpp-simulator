@@ -8,10 +8,13 @@ import asyncio
 import json
 import uuid
 import websockets
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 import sys
+
+# Set stdout to be line-buffered to prevent blocking
+sys.stdout.reconfigure(line_buffering=True)
 
 
 class ChargePointStatus(Enum):
@@ -56,11 +59,13 @@ class OCPP16ChargePoint:
         self.transaction_id: Optional[int] = None
         self.id_tag: Optional[str] = None
         self.meter_value = 0
-        self.charging_current = 0.0
+        self.charging_current = 16.0  # Default charging current
         self.charging_voltage = 230.0
         self.charging_power = 0.0
         self.is_charging = False
         self.battery_soc = 20.0  # Start with 20% battery
+        self.auto_stop_at_full = True  # Auto stop when battery is 100%
+        self.verbose_logging = False  # Detailed OCPP message logging
         self.message_queue = asyncio.Queue()
         
     async def connect(self):
@@ -82,7 +87,12 @@ class OCPP16ChargePoint:
     async def send_message(self, message: list):
         """Send OCPP message"""
         message_json = json.dumps(message)
-        print(f"📤 Sending: {message_json}")
+        # Print to stdout in non-blocking way (only in verbose mode)
+        if self.verbose_logging:
+            try:
+                print(f"📤 Sending: {message_json}", flush=True)
+            except BlockingIOError:
+                pass  # Ignore if stdout is blocked
         await self.websocket.send(message_json)
     
     async def send_call(self, action: str, payload: dict) -> str:
@@ -125,7 +135,7 @@ class OCPP16ChargePoint:
             "connectorId": self.connector_id,
             "errorCode": error_code.value,
             "status": status.value,
-            "timestamp": datetime.utcnow().isoformat() + "Z"
+            "timestamp": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
         }
         
         await self.send_call("StatusNotification", payload)
@@ -137,7 +147,7 @@ class OCPP16ChargePoint:
             "connectorId": self.connector_id,
             "idTag": id_tag,
             "meterStart": self.meter_value,
-            "timestamp": datetime.utcnow().isoformat() + "Z"
+            "timestamp": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
         }
         await self.send_call("StartTransaction", payload)
     
@@ -150,7 +160,7 @@ class OCPP16ChargePoint:
         payload = {
             "transactionId": self.transaction_id,
             "meterStop": self.meter_value,
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
             "reason": reason
         }
         
@@ -164,7 +174,7 @@ class OCPP16ChargePoint:
         if self.transaction_id is None:
             return
         
-        timestamp = datetime.utcnow().isoformat() + "Z"
+        timestamp = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
         
         payload = {
             "connectorId": self.connector_id,
@@ -216,7 +226,11 @@ class OCPP16ChargePoint:
         }
         
         await self.send_call("MeterValues", payload)
-        print(f"⚡ Meter: {self.meter_value}Wh | Current: {self.charging_current:.2f}A | Power: {self.charging_power:.2f}W | Battery: {self.battery_soc:.1f}%")
+        # Print to stdout in non-blocking way
+        try:
+            print(f"⚡ Meter: {self.meter_value}Wh | Current: {self.charging_current:.2f}A | Power: {self.charging_power:.2f}W | Battery: {self.battery_soc:.1f}%", flush=True)
+        except BlockingIOError:
+            pass  # Ignore if stdout is blocked
     
     async def send_heartbeat(self):
         """Send Heartbeat"""
@@ -285,27 +299,28 @@ class OCPP16ChargePoint:
         """Simulate charging process with meter values"""
         import random
         
-        # Charging parameters
-        self.charging_current = 16.0  # 16A
-        self.charging_voltage = 230.0  # 230V
-        self.charging_power = self.charging_current * self.charging_voltage  # ~3680W
+        # Use current charging_current value (don't reset it)
+        # self.charging_current is already set from CLI or default (16A)
+        base_charging_current = self.charging_current  # Save the user-set value
+        self.charging_power = self.charging_current * self.charging_voltage
         
         # Battery simulation (assuming ~50kWh battery capacity)
         battery_capacity_wh = 50000  # 50 kWh
         
-        print(f"🔋 Charging started: {self.charging_current}A @ {self.charging_voltage}V = {self.charging_power}W | Battery: {self.battery_soc:.1f}%")
+        print(f"🔋 Charging started: {self.charging_current:.1f}A @ {self.charging_voltage}V = {self.charging_power:.1f}W | Battery: {self.battery_soc:.1f}%")
+        print(f"   Auto-stop at 100%: {'Enabled' if self.auto_stop_at_full else 'Disabled'}")
+        
+        # Calculate time to full charge
+        remaining_capacity = battery_capacity_wh * ((100 - self.battery_soc) / 100)
+        time_to_full_hours = remaining_capacity / self.charging_power if self.charging_power > 0 else 0
+        time_to_full_minutes = time_to_full_hours * 60
+        print(f"   Estimated time to full: {time_to_full_minutes:.1f} minutes (at {self.charging_current:.1f}A)")
         
         while self.is_charging and self.transaction_id is not None:
-            # Stop if battery is full
-            if self.battery_soc >= 100.0:
-                print("🔋 Battery full (100%) - stopping charge")
-                self.battery_soc = 100.0
-                await asyncio.sleep(2)
-                await self.auto_stop_transaction("EVDisconnected")
-                break
-            
-            # Increment energy faster - simulate 60 seconds worth of charging every 5 seconds
-            energy_increment = (self.charging_power / 3600) * 60  # 60 seconds worth
+            # Calculate energy increment based on actual charging power and time interval (5 seconds)
+            # Energy (Wh) = Power (W) * Time (hours)
+            # For 5 seconds: Energy = Power * (5/3600)
+            energy_increment = self.charging_power * (5 / 3600)
             self.meter_value += int(energy_increment)
             
             # Update battery SoC based on energy added
@@ -313,13 +328,22 @@ class OCPP16ChargePoint:
             soc_increment = (energy_increment / battery_capacity_wh) * 100
             self.battery_soc += soc_increment
             
-            # Limit to 100%
-            if self.battery_soc > 100.0:
+            # Check if battery is full
+            if self.battery_soc >= 100.0:
                 self.battery_soc = 100.0
+                
+                # Auto stop if enabled
+                if self.auto_stop_at_full:
+                    print("🔋 Battery full (100%) - auto stopping charge")
+                    await asyncio.sleep(2)
+                    await self.auto_stop_transaction("EVDisconnected")
+                    break
             
             # Add some variation to current (less current as battery gets fuller)
-            charging_rate = 1.0 if self.battery_soc < 80 else (100 - self.battery_soc) / 20
-            self.charging_current = (16.0 * charging_rate) + random.uniform(-0.5, 0.5)
+            charging_rate = 1.0 if self.battery_soc < 80 else max(0.2, (100 - self.battery_soc) / 20)
+            self.charging_current = (base_charging_current * charging_rate) + random.uniform(-0.5, 0.5)
+            if self.charging_current < 0:
+                self.charging_current = 0.5
             self.charging_power = self.charging_current * self.charging_voltage
             
             # Send meter values every 5 seconds
@@ -359,7 +383,7 @@ class OCPP16ChargePoint:
             
             self.transaction_id = None
             self.id_tag = None
-            self.battery_soc = 20.0  # Reset to 20% for next charge
+            # Don't reset battery SoC - keep current charge level
             
             print(f"✅ Transaction stopped successfully")
             
@@ -370,7 +394,12 @@ class OCPP16ChargePoint:
         """Handle incoming OCPP message"""
         try:
             message = json.loads(message_text)
-            print(f"📥 Received: {message_text}")
+            # Print to stdout in non-blocking way (only in verbose mode)
+            if self.verbose_logging:
+                try:
+                    print(f"📥 Received: {message_text}", flush=True)
+                except BlockingIOError:
+                    pass
             
             message_type = message[0]
             
@@ -440,14 +469,17 @@ class OCPP16ChargePoint:
         print("🎛️  CLI CONTROL PANEL")
         print("="*60)
         print("Commands:")
-        print("  status <status>  - Change status (available, charging, faulted, etc.)")
-        print("  error <code>     - Set error code (NoError, GroundFailure, etc.)")
-        print("  start <idTag>    - Start transaction manually")
-        print("  stop             - Stop current transaction")
-        print("  current <amps>   - Set charging current (A)")
-        print("  info             - Show current state")
-        print("  help             - Show this help")
-        print("  quit             - Exit simulator")
+        print("  status <status>     - Change status (available, charging, faulted, etc.)")
+        print("  error <code>        - Set error code (NoError, GroundFailure, etc.)")
+        print("  start <idTag>       - Start transaction manually")
+        print("  stop                - Stop current transaction")
+        print("  current <amps>      - Set charging current (A)")
+        print("  soc <percent>       - Set battery SoC level (0-100%)")
+        print("  autostop <on|off>   - Enable/disable auto-stop at 100%")
+        print("  verbose <on|off>    - Enable/disable verbose OCPP logging")
+        print("  info                - Show current state")
+        print("  help                - Show this help")
+        print("  quit                - Exit simulator")
         print("="*60 + "\n")
         
         try:
@@ -504,11 +536,63 @@ class OCPP16ChargePoint:
                             print("Usage: current <amps>")
                             continue
                         try:
-                            self.charging_current = float(arg)
+                            new_current = float(arg)
+                            self.charging_current = new_current
                             self.charging_power = self.charging_current * self.charging_voltage
-                            print(f"⚡ Current set to {self.charging_current}A, Power: {self.charging_power}W")
+                            
+                            # Calculate time to full
+                            battery_capacity_wh = 50000
+                            remaining_capacity = battery_capacity_wh * ((100 - self.battery_soc) / 100)
+                            time_to_full_hours = remaining_capacity / self.charging_power if self.charging_power > 0 else 0
+                            time_to_full_minutes = time_to_full_hours * 60
+                            
+                            print(f"⚡ Current set to {self.charging_current:.1f}A")
+                            print(f"   Power: {self.charging_power:.1f}W")
+                            print(f"   Time to full from {self.battery_soc:.1f}%: {time_to_full_minutes:.1f} minutes")
                         except ValueError:
                             print("Invalid current value")
+                    
+                    elif command == "soc":
+                        if not arg:
+                            print("Usage: soc <percent>")
+                            continue
+                        try:
+                            soc = float(arg)
+                            if 0 <= soc <= 100:
+                                self.battery_soc = soc
+                                print(f"🔋 Battery SoC set to {self.battery_soc:.1f}%")
+                            else:
+                                print("SoC must be between 0 and 100")
+                        except ValueError:
+                            print("Invalid SoC value")
+                    
+                    elif command == "autostop":
+                        if not arg:
+                            print(f"Auto-stop at 100%: {'Enabled' if self.auto_stop_at_full else 'Disabled'}")
+                            print("Usage: autostop <on|off>")
+                            continue
+                        if arg.lower() in ['on', 'true', '1', 'yes']:
+                            self.auto_stop_at_full = True
+                            print("✅ Auto-stop at 100% enabled")
+                        elif arg.lower() in ['off', 'false', '0', 'no']:
+                            self.auto_stop_at_full = False
+                            print("⚠️  Auto-stop at 100% disabled")
+                        else:
+                            print("Usage: autostop <on|off>")
+                    
+                    elif command == "verbose":
+                        if not arg:
+                            print(f"Verbose logging: {'Enabled' if self.verbose_logging else 'Disabled'}")
+                            print("Usage: verbose <on|off>")
+                            continue
+                        if arg.lower() in ['on', 'true', '1', 'yes']:
+                            self.verbose_logging = True
+                            print("✅ Verbose logging enabled - will show all OCPP messages")
+                        elif arg.lower() in ['off', 'false', '0', 'no']:
+                            self.verbose_logging = False
+                            print("✅ Verbose logging disabled - showing summary only")
+                        else:
+                            print("Usage: verbose <on|off>")
                     
                     elif command == "info":
                         print(f"\n📊 Current State:")
@@ -521,6 +605,8 @@ class OCPP16ChargePoint:
                         print(f"  Voltage: {self.charging_voltage:.2f} V")
                         print(f"  Power: {self.charging_power:.2f} W")
                         print(f"  Battery SoC: {self.battery_soc:.1f} %")
+                        print(f"  Auto-stop at 100%: {'Enabled' if self.auto_stop_at_full else 'Disabled'}")
+                        print(f"  Verbose logging: {'Enabled' if self.verbose_logging else 'Disabled'}")
                         print(f"  Charging: {self.is_charging}\n")
                     
                     elif command == "help":
